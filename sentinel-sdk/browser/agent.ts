@@ -2,9 +2,14 @@ import { LogLayer, LogLevel, LogRecord } from '../core/types.ts';
 
 export class SentinelBrowser {
   private serviceName: string;
+  private collectorUrl: string;
 
-  constructor(serviceName: string = 'browser-app') {
+  constructor(
+    serviceName: string = 'browser-app',
+    collectorUrl: string = 'http://localhost:8000/logs'
+  ) {
     this.serviceName = serviceName;
+    this.collectorUrl = collectorUrl;
   }
 
   hook() {
@@ -19,7 +24,27 @@ export class SentinelBrowser {
       level: LogLevel.INFO,
       service: this.serviceName,
     });
+
+    this.log(record);
+  }
+
+  private async sendToCollector(record: LogRecord) {
+    try {
+      await fetch(this.collectorUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(record),
+      });
+    } catch (err) {
+      console.error('[SENTINEL] Failed to send log:', err);
+    }
+  }
+
+  private log(record: LogRecord) {
     console.log(record.toString());
+    this.sendToCollector(record);
   }
 
   private patchFetch() {
@@ -29,29 +54,37 @@ export class SentinelBrowser {
     const wrappedFetch = async (...args: any[]) => {
       const [resource, config] = args;
       const startTime = performance.now();
-      
+
       const record = new LogRecord({
         message: `Fetch Request: ${resource}`,
         layer: LogLayer.SERVICE,
         level: LogLevel.INFO,
         service: self.serviceName,
-        context: { resource, method: config?.method || 'GET' }
+        context: {
+          resource,
+          method: config?.method || 'GET',
+        },
       });
-      console.log(record.toString());
+
+      self.log(record);
 
       try {
         const response = await originalFetch(...args);
         const duration = performance.now() - startTime;
-        
+
         const resRecord = new LogRecord({
           message: `Fetch Completed: ${resource} -> ${response.status}`,
           layer: LogLayer.SERVICE,
           level: response.ok ? LogLevel.INFO : LogLevel.ERROR,
           service: self.serviceName,
-          context: { status: response.status, durationMs: duration }
+          context: {
+            status: response.status,
+            durationMs: duration,
+          },
         });
-        console.log(resRecord.toString());
-        
+
+        self.log(resRecord);
+
         return response;
       } catch (error) {
         const errRecord = new LogRecord({
@@ -59,9 +92,13 @@ export class SentinelBrowser {
           layer: LogLayer.SERVICE,
           level: LogLevel.ERROR,
           service: self.serviceName,
-          context: { error: String(error) }
+          context: {
+            error: String(error),
+          },
         });
-        console.log(errRecord.toString());
+
+        self.log(errRecord);
+
         throw error;
       }
     };
@@ -71,47 +108,62 @@ export class SentinelBrowser {
         value: wrappedFetch,
         configurable: true,
         writable: true,
-        enumerable: true
+        enumerable: true,
       });
     } catch (e) {
-      // Fallback for very restrictive environments
       (window as any).fetch = wrappedFetch;
     }
   }
 
   private hookEvents() {
     const self = this;
-    ['click', 'submit', 'scroll'].forEach(eventType => {
-      window.addEventListener(eventType, (e) => {
-        const target = e.target as HTMLElement;
-        const record = new LogRecord({
-          message: `User Interaction: ${eventType} on ${target.tagName || 'window'}`,
-          layer: LogLayer.PRESENTATION,
-          level: LogLevel.INFO,
-          service: self.serviceName,
-          context: {
-            eventType,
-            id: target.id,
-            className: target.className,
-            text: target.innerText?.substring(0, 50),
-          }
-        });
-        console.log(record.toString());
-      }, { capture: true, passive: true });
+
+    ['click', 'submit', 'scroll'].forEach((eventType) => {
+      window.addEventListener(
+        eventType,
+        (e) => {
+          const target = e.target as HTMLElement;
+
+          const record = new LogRecord({
+            message: `User Interaction: ${eventType} on ${
+              target.tagName || 'window'
+            }`,
+            layer: LogLayer.PRESENTATION,
+            level: LogLevel.INFO,
+            service: self.serviceName,
+            context: {
+              eventType,
+              id: target.id,
+              className: target.className,
+              text: target.innerText?.substring(0, 50),
+            },
+          });
+
+          self.log(record);
+        },
+        { capture: true, passive: true }
+      );
     });
   }
 
   private hookErrors() {
     const self = this;
+
     window.onerror = (message, source, lineno, colno, error) => {
       const record = new LogRecord({
         message: `Frontend Error: ${message}`,
         layer: LogLayer.SECURITY,
         level: LogLevel.FATAL,
         service: self.serviceName,
-        context: { source, lineno, colno, stack: error?.stack }
+        context: {
+          source,
+          lineno,
+          colno,
+          stack: error?.stack,
+        },
       });
-      console.log(record.toString());
+
+      self.log(record);
     };
 
     window.onunhandledrejection = (event) => {
@@ -120,14 +172,16 @@ export class SentinelBrowser {
         layer: LogLayer.OBSERVABILITY,
         level: LogLevel.ERROR,
         service: self.serviceName,
-        context: { reason: event.reason }
+        context: {
+          reason: event.reason,
+        },
       });
-      console.log(record.toString());
+
+      self.log(record);
     };
   }
 
   private monitorVitals() {
-    // Simple Web Vitals monitoring
     if ('PerformanceObserver' in window) {
       const observer = new PerformanceObserver((list) => {
         list.getEntries().forEach((entry) => {
@@ -139,18 +193,32 @@ export class SentinelBrowser {
             context: {
               value: (entry as any).value || (entry as any).startTime,
               entryType: entry.entryType,
-            }
+            },
           });
-          console.log(record.toString());
+
+          this.log(record);
         });
       });
-      observer.observe({ entryTypes: ['paint', 'largest-contentful-paint', 'layout-shift', 'navigation'] });
+
+      observer.observe({
+        entryTypes: [
+          'paint',
+          'largest-contentful-paint',
+          'layout-shift',
+          'navigation',
+        ],
+      });
     }
   }
 }
 
-export const initBrowserSentinel = (name?: string) => {
-  const sentinel = new SentinelBrowser(name);
+export const initBrowserSentinel = (
+  name?: string,
+  collectorUrl?: string
+) => {
+  const sentinel = new SentinelBrowser(name, collectorUrl);
+
   sentinel.hook();
+
   return sentinel;
 };
