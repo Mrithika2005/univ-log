@@ -2,14 +2,44 @@ import { LogLayer, LogLevel, LogRecord } from '../core/types.ts';
 
 export class SentinelBrowser {
   private serviceName: string;
-  private collectorUrl: string;
 
-  constructor(
-    serviceName: string = 'browser-app',
-    collectorUrl: string = 'http://localhost:8000/logs'
-  ) {
+  private clickhouseHost: string;
+  private clickhouseDatabase: string;
+  private clickhouseTable: string;
+
+  private clickhouseUser?: string;
+  private clickhousePassword?: string;
+
+  private authHeader?: string;
+
+  constructor(serviceName: string = 'browser-app') {
     this.serviceName = serviceName;
-    this.collectorUrl = collectorUrl;
+
+    this.clickhouseHost =
+      (window as any).__SENTINEL_CLICKHOUSE_HOST__ ||
+      'http://localhost:8123';
+
+    this.clickhouseDatabase =
+      (window as any).__SENTINEL_CLICKHOUSE_DATABASE__ ||
+      'sentinel';
+
+    this.clickhouseTable =
+      (window as any).__SENTINEL_CLICKHOUSE_TABLE__ ||
+      'logs';
+
+    this.clickhouseUser =
+      (window as any).__SENTINEL_CLICKHOUSE_USER__;
+
+    this.clickhousePassword =
+      (window as any).__SENTINEL_CLICKHOUSE_PASSWORD__;
+
+    if (this.clickhouseUser) {
+      this.authHeader = `Basic ${btoa(
+        `${this.clickhouseUser}:${this.clickhousePassword || ''}`
+      )}`;
+    }
+
+    void this.initClickhouse();
   }
 
   hook() {
@@ -28,31 +58,143 @@ export class SentinelBrowser {
     this.log(record);
   }
 
-  private async sendToCollector(record: LogRecord) {
+  private async executeQuery(query: string) {
     try {
-      await fetch(this.collectorUrl, {
+      const url = `${this.clickhouseHost}/?query=${encodeURIComponent(
+        query
+      )}`;
+
+      const headers: Record<string, string> = {};
+
+      if (this.authHeader) {
+        headers.Authorization = this.authHeader;
+      }
+
+      const response = await fetch(url, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(record),
+        headers,
       });
+
+      if (!response.ok) {
+        console.error(
+          '[SENTINEL] ClickHouse query failed:',
+          response.status
+        );
+      }
     } catch (err) {
-      console.error('[SENTINEL] Failed to send log:', err);
+      console.error('[SENTINEL] Query error:', err);
+    }
+  }
+
+  private async initClickhouse() {
+    try {
+      const createDbQuery = `
+        CREATE DATABASE IF NOT EXISTS ${this.clickhouseDatabase}
+      `;
+
+      await this.executeQuery(createDbQuery);
+
+      const createTableQuery = `
+        CREATE TABLE IF NOT EXISTS
+        ${this.clickhouseDatabase}.${this.clickhouseTable}
+        (
+          timestamp String,
+          record_id String,
+          trace_id String,
+          span_id String,
+          service String,
+          env String,
+          layer String,
+          level String,
+          message String,
+          context String
+        )
+        ENGINE = MergeTree()
+        ORDER BY (timestamp, service)
+      `;
+
+      await this.executeQuery(createTableQuery);
+
+      console.log(
+        '[SENTINEL] Browser ClickHouse initialized'
+      );
+    } catch (err) {
+      console.error(
+        '[SENTINEL] ClickHouse init failed:',
+        err
+      );
+    }
+  }
+
+  private async sendToClickhouse(record: LogRecord) {
+    try {
+      const query = `
+        INSERT INTO
+        ${this.clickhouseDatabase}.${this.clickhouseTable}
+        FORMAT JSONEachRow
+      `;
+
+      const url = `${this.clickhouseHost}/?query=${encodeURIComponent(
+        query
+      )}`;
+
+      const payload = {
+        timestamp: (record as any).timestamp,
+        record_id: (record as any).record_id,
+        trace_id: (record as any).trace_id,
+        span_id: (record as any).span_id,
+        service: (record as any).service,
+        env: (record as any).env,
+        layer: (record as any).layer,
+        level: (record as any).level,
+        message: (record as any).message,
+        context: JSON.stringify(
+          (record as any).context || {}
+        ),
+      };
+
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+
+      if (this.authHeader) {
+        headers.Authorization = this.authHeader;
+      }
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        console.error(
+          '[SENTINEL] ClickHouse ingest failed:',
+          response.status
+        );
+      }
+    } catch (err) {
+      console.error(
+        '[SENTINEL] Failed to write log:',
+        err
+      );
     }
   }
 
   private log(record: LogRecord) {
     console.log(record.toString());
-    this.sendToCollector(record);
+
+    void this.sendToClickhouse(record);
   }
 
   private patchFetch() {
     const originalFetch = window.fetch.bind(window);
+
     const self = this;
 
     const wrappedFetch = async (...args: any[]) => {
       const [resource, config] = args;
+
       const startTime = performance.now();
 
       const record = new LogRecord({
@@ -70,13 +212,21 @@ export class SentinelBrowser {
 
       try {
         const response = await originalFetch(...args);
-        const duration = performance.now() - startTime;
+
+        const duration =
+          performance.now() - startTime;
 
         const resRecord = new LogRecord({
           message: `Fetch Completed: ${resource} -> ${response.status}`,
+
           layer: LogLayer.SERVICE,
-          level: response.ok ? LogLevel.INFO : LogLevel.ERROR,
+
+          level: response.ok
+            ? LogLevel.INFO
+            : LogLevel.ERROR,
+
           service: self.serviceName,
+
           context: {
             status: response.status,
             durationMs: duration,
@@ -89,9 +239,13 @@ export class SentinelBrowser {
       } catch (error) {
         const errRecord = new LogRecord({
           message: `Fetch Failed: ${resource}`,
+
           layer: LogLayer.SERVICE,
+
           level: LogLevel.ERROR,
+
           service: self.serviceName,
+
           context: {
             error: String(error),
           },
@@ -118,43 +272,66 @@ export class SentinelBrowser {
   private hookEvents() {
     const self = this;
 
-    ['click', 'submit', 'scroll'].forEach((eventType) => {
-      window.addEventListener(
-        eventType,
-        (e) => {
-          const target = e.target as HTMLElement;
+    ['click', 'submit', 'scroll'].forEach(
+      (eventType) => {
+        window.addEventListener(
+          eventType,
+          (e) => {
+            const target =
+              e.target as HTMLElement;
 
-          const record = new LogRecord({
-            message: `User Interaction: ${eventType} on ${
-              target.tagName || 'window'
-            }`,
-            layer: LogLayer.PRESENTATION,
-            level: LogLevel.INFO,
-            service: self.serviceName,
-            context: {
-              eventType,
-              id: target.id,
-              className: target.className,
-              text: target.innerText?.substring(0, 50),
-            },
-          });
+            const record = new LogRecord({
+              message: `User Interaction: ${eventType} on ${
+                target.tagName || 'window'
+              }`,
 
-          self.log(record);
-        },
-        { capture: true, passive: true }
-      );
-    });
+              layer: LogLayer.PRESENTATION,
+
+              level: LogLevel.INFO,
+
+              service: self.serviceName,
+
+              context: {
+                eventType,
+                id: target.id,
+                className: target.className,
+                text: target.innerText?.substring(
+                  0,
+                  50
+                ),
+              },
+            });
+
+            self.log(record);
+          },
+          {
+            capture: true,
+            passive: true,
+          }
+        );
+      }
+    );
   }
 
   private hookErrors() {
     const self = this;
 
-    window.onerror = (message, source, lineno, colno, error) => {
+    window.onerror = (
+      message,
+      source,
+      lineno,
+      colno,
+      error
+    ) => {
       const record = new LogRecord({
         message: `Frontend Error: ${message}`,
+
         layer: LogLayer.SECURITY,
+
         level: LogLevel.FATAL,
+
         service: self.serviceName,
+
         context: {
           source,
           lineno,
@@ -166,12 +343,18 @@ export class SentinelBrowser {
       self.log(record);
     };
 
-    window.onunhandledrejection = (event) => {
+    window.onunhandledrejection = (
+      event
+    ) => {
       const record = new LogRecord({
         message: `Unhandled Promise Rejection: ${event.reason}`,
+
         layer: LogLayer.OBSERVABILITY,
+
         level: LogLevel.ERROR,
+
         service: self.serviceName,
+
         context: {
           reason: event.reason,
         },
@@ -183,22 +366,31 @@ export class SentinelBrowser {
 
   private monitorVitals() {
     if ('PerformanceObserver' in window) {
-      const observer = new PerformanceObserver((list) => {
-        list.getEntries().forEach((entry) => {
-          const record = new LogRecord({
-            message: `Web Vital: ${entry.name}`,
-            layer: LogLayer.PRESENTATION,
-            level: LogLevel.INFO,
-            service: this.serviceName,
-            context: {
-              value: (entry as any).value || (entry as any).startTime,
-              entryType: entry.entryType,
-            },
-          });
+      const observer = new PerformanceObserver(
+        (list) => {
+          list.getEntries().forEach((entry) => {
+            const record = new LogRecord({
+              message: `Web Vital: ${entry.name}`,
 
-          this.log(record);
-        });
-      });
+              layer: LogLayer.PRESENTATION,
+
+              level: LogLevel.INFO,
+
+              service: this.serviceName,
+
+              context: {
+                value:
+                  (entry as any).value ||
+                  (entry as any).startTime,
+
+                entryType: entry.entryType,
+              },
+            });
+
+            this.log(record);
+          });
+        }
+      );
 
       observer.observe({
         entryTypes: [
@@ -213,10 +405,9 @@ export class SentinelBrowser {
 }
 
 export const initBrowserSentinel = (
-  name?: string,
-  collectorUrl?: string
+  name?: string
 ) => {
-  const sentinel = new SentinelBrowser(name, collectorUrl);
+  const sentinel = new SentinelBrowser(name);
 
   sentinel.hook();
 
